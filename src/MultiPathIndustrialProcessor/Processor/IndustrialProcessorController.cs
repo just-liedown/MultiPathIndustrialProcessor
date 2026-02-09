@@ -97,30 +97,36 @@ internal sealed class IndustrialProcessorController
             return;
 
         var who = Game1.player;
-        var playerTile = who.Tile;
+        var playerTile = who.TilePoint;
+        var grabTile = who.GetGrabTile().ToPoint();
 
-        // The design doc treats "stand at the port" as the action selector, so use the player's tile
-        // rather than the cursor tile to avoid mis-clicks.
-        var candidateTiles = new[]
+        // Prefer player standing tile for port selection, but also support interacting with the tile in
+        // front of the player (grab tile) to match vanilla behavior.
+        var portTileCandidates = new[] { playerTile, grabTile };
+
+        foreach (var portTile in portTileCandidates)
         {
-            playerTile,
-            playerTile + new Vector2(0, -1),
-            playerTile + new Vector2(0, 1),
-            playerTile + new Vector2(1, 0),
-            playerTile + new Vector2(-1, 0)
-        };
+            var buildingSearchTiles = new[]
+            {
+                portTile,
+                new Point(portTile.X, portTile.Y - 1),
+                new Point(portTile.X, portTile.Y + 1),
+                new Point(portTile.X + 1, portTile.Y),
+                new Point(portTile.X - 1, portTile.Y)
+            };
 
-        foreach (var tile in candidateTiles)
-        {
-            var building = location.getBuildingAt(tile);
-            if (building is null || !this.IsProcessor(building))
-                continue;
+            foreach (var tile in buildingSearchTiles)
+            {
+                var building = location.getBuildingAt(new Vector2(tile.X, tile.Y));
+                if (building is null || !this.IsProcessor(building))
+                    continue;
 
-            if (!this.TryHandleInteraction(building, playerTile, who))
-                continue;
+                if (!this.TryHandleInteraction(building, portTile, who))
+                    continue;
 
-            helper.Input.Suppress(e.Button);
-            return;
+                helper.Input.Suppress(e.Button);
+                return;
+            }
         }
     }
 
@@ -162,7 +168,7 @@ internal sealed class IndustrialProcessorController
         }
     }
 
-    private bool TryHandleInteraction(Building building, Vector2 cursorTile, Farmer who)
+    private bool TryHandleInteraction(Building building, Point portTile, Farmer who)
     {
         var origin = new Point(building.tileX.Value, building.tileY.Value);
         // v1 layout (per design doc):
@@ -170,36 +176,41 @@ internal sealed class IndustrialProcessorController
         // - top: 1 unified output port
         // - left: coal port
         // - right: management terminal
-        var outputPort = new Vector2(origin.X + 3, origin.Y - 1);
-        var coalPort = new Vector2(origin.X - 1, origin.Y + 2);
-        var terminalPort = new Vector2(origin.X + 7, origin.Y + 2);
+        var outputPort = new Point(origin.X + 3, origin.Y - 1);
+        var coalPort = new Point(origin.X - 1, origin.Y + 2);
+        var terminalPort = new Point(origin.X + 7, origin.Y + 2);
 
-        if (cursorTile == outputPort)
+        if (portTile == outputPort)
             return this.OpenOutput(building);
 
-        if (cursorTile == terminalPort)
+        if (portTile == terminalPort)
         {
             monitor.Log("IndustrialProcessor: terminal not implemented yet (v1).", LogLevel.Info);
             return true;
         }
 
-        if (cursorTile == coalPort)
+        if (portTile == coalPort)
             return this.TryHandleCoalPort(building, who);
 
-        var modulePorts = new Dictionary<Vector2, IndustrialModule>
+        if (portTile.Y == origin.Y + 4)
         {
-            [new Vector2(origin.X + 0, origin.Y + 4)] = IndustrialModule.Animal,
-            [new Vector2(origin.X + 1, origin.Y + 4)] = IndustrialModule.Brew,
-            [new Vector2(origin.X + 2, origin.Y + 4)] = IndustrialModule.Preserve,
-            [new Vector2(origin.X + 3, origin.Y + 4)] = IndustrialModule.Smelt,
-            [new Vector2(origin.X + 4, origin.Y + 4)] = IndustrialModule.Wool,
-            [new Vector2(origin.X + 5, origin.Y + 4)] = IndustrialModule.Oil
-        };
+            var dx = portTile.X - origin.X;
+            var module = dx switch
+            {
+                0 => IndustrialModule.Animal,
+                1 => IndustrialModule.Brew,
+                2 => IndustrialModule.Preserve,
+                3 => IndustrialModule.Smelt,
+                4 => IndustrialModule.Wool,
+                5 => IndustrialModule.Oil,
+                _ => (IndustrialModule?)null
+            };
 
-        if (!modulePorts.TryGetValue(cursorTile, out var module))
-            return false;
+            if (module is not null)
+                return this.TryStartModuleJob(building, module.Value, who);
+        }
 
-        return this.TryStartModuleJob(building, module, who);
+        return false;
     }
 
     private bool OpenOutput(Building building)
