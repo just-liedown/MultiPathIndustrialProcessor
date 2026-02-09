@@ -44,6 +44,7 @@ internal sealed class IndustrialProcessorState
 {
     public int Version { get; set; } = 1;
     public int Fuel { get; set; }
+    public int FuelReserved { get; set; }
     public Dictionary<IndustrialModule, IndustrialModuleState> Modules { get; set; } = new();
 
     public static readonly IndustrialModule[] ModuleOrder = new[]
@@ -78,6 +79,14 @@ internal sealed class IndustrialProcessorState
     {
         foreach (var module in ModuleOrder)
             _ = this.GetModuleState(module);
+
+        if (this.FuelReserved < 0)
+            this.FuelReserved = 0;
+        if (this.Fuel < 0)
+            this.Fuel = 0;
+        if (this.FuelReserved > this.Fuel)
+            this.FuelReserved = this.Fuel;
+
         return this;
     }
 }

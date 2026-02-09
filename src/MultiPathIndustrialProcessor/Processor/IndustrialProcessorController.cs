@@ -233,7 +233,8 @@ internal sealed class IndustrialProcessorController
         var held = who.ActiveItem;
         if (held is null)
         {
-            monitor.Log($"IndustrialProcessor: fuel = {state.Fuel}.", LogLevel.Info);
+            var available = state.Fuel - state.FuelReserved;
+            monitor.Log($"IndustrialProcessor: fuel = {state.Fuel} (available {available}, reserved {state.FuelReserved}).", LogLevel.Info);
             return true;
         }
 
@@ -247,7 +248,8 @@ internal sealed class IndustrialProcessorController
         state.Fuel += add;
         this.SaveState(building, state);
         this.ConsumeActiveItem(who, add);
-        monitor.Log($"IndustrialProcessor: added fuel +{add} (total {state.Fuel}).", LogLevel.Info);
+        var availableAfter = state.Fuel - state.FuelReserved;
+        monitor.Log($"IndustrialProcessor: added fuel +{add} (total {state.Fuel}, available {availableAfter}).", LogLevel.Info);
         return true;
     }
 
@@ -299,19 +301,35 @@ internal sealed class IndustrialProcessorController
         }
 
         var now = this.GetNowAbsoluteMinutes();
-        moduleState.Tasks.Add(new IndustrialJob
+        var job = new IndustrialJob
         {
-            ReadyAtAbsoluteMinutes = now + recipe.Minutes,
             Minutes = recipe.Minutes,
             OutputItemId = recipe.OutputItemId,
             OutputStack = recipe.OutputStack,
             OutputQuality = 0,
             FuelCost = 1
-        });
+        };
+
+        var availableFuel = state.Fuel - state.FuelReserved;
+        if (availableFuel >= job.FuelCost)
+        {
+            state.FuelReserved += job.FuelCost;
+            job.ReadyAtAbsoluteMinutes = now + job.Minutes;
+        }
+        else
+        {
+            // no fuel yet; job is queued and the timer will start once fuel is available
+            job.ReadyAtAbsoluteMinutes = 0;
+        }
+
+        moduleState.Tasks.Add(job);
 
         this.SaveState(building, state);
         this.ConsumeActiveItem(who, recipe.InputCount);
-        monitor.Log($"IndustrialProcessor: started Smelt, ready in {recipe.Minutes} min -> {recipe.OutputItemId} x{recipe.OutputStack} (fuel on finish).", LogLevel.Info);
+        if (job.ReadyAtAbsoluteMinutes > 0)
+            monitor.Log($"IndustrialProcessor: started Smelt, ready in {recipe.Minutes} min -> {recipe.OutputItemId} x{recipe.OutputStack}.", LogLevel.Info);
+        else
+            monitor.Log($"IndustrialProcessor: queued Smelt (waiting for coal), will take {recipe.Minutes} min -> {recipe.OutputItemId} x{recipe.OutputStack}.", LogLevel.Info);
         return true;
     }
 
@@ -396,10 +414,29 @@ internal sealed class IndustrialProcessorController
             for (var i = moduleState.Tasks.Count - 1; i >= 0; i--)
             {
                 var task = moduleState.Tasks[i];
-                if (task.ReadyAtAbsoluteMinutes > now)
-                    continue;
 
-                if (task.FuelCost > 0 && state.Fuel < task.FuelCost)
+                // Smelting jobs may be queued without fuel; start their timer once fuel becomes available.
+                if (task.ReadyAtAbsoluteMinutes == 0)
+                {
+                    if (task.FuelCost <= 0)
+                    {
+                        task.ReadyAtAbsoluteMinutes = now + task.Minutes;
+                        changed = true;
+                        continue;
+                    }
+
+                    var availableFuel = state.Fuel - state.FuelReserved;
+                    if (availableFuel >= task.FuelCost)
+                    {
+                        state.FuelReserved += task.FuelCost;
+                        task.ReadyAtAbsoluteMinutes = now + task.Minutes;
+                        changed = true;
+                    }
+
+                    continue;
+                }
+
+                if (task.ReadyAtAbsoluteMinutes > now)
                     continue;
 
                 var item = ItemRegistry.Create(task.OutputItemId, task.OutputStack);
@@ -412,7 +449,10 @@ internal sealed class IndustrialProcessorController
                     continue; // output full
 
                 if (task.FuelCost > 0)
+                {
+                    state.FuelReserved -= task.FuelCost;
                     state.Fuel -= task.FuelCost;
+                }
 
                 moduleState.Tasks.RemoveAt(i);
                 changed = true;
