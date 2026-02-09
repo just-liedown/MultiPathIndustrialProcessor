@@ -1,0 +1,15 @@
+.dotnet/
+.tmp/
+.vs/
+.vscode/
+
+# Stardew/SMAPI local overrides
+stardewvalley.targets
+
+# .NET build output
+bin/
+obj/
+
+# OS/editor
+.DS_Store
+Thumbs.db

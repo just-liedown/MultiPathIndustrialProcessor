@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <!-- Replace PATH_HERE with the folder containing the Stardew Valley executable. -->
+    <GamePath>PATH_HERE</GamePath>
+  </PropertyGroup>
+</Project>

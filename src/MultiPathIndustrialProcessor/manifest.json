@@ -1,0 +1,9 @@
+{
+  "Name": "多路工业加工站",
+  "Author": "YourName",
+  "Version": "0.1.0",
+  "Description": "一台高度集成的多路工业加工站（空间化多通道输入 + 统一产物出口）。",
+  "UniqueID": "YourName.MultiPathIndustrialProcessor",
+  "EntryDll": "MultiPathIndustrialProcessor.dll",
+  "MinimumApiVersion": "4.0.0"
+}

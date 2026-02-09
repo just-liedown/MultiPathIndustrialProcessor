@@ -1,0 +1,7 @@
+{
+  "log.entry": "MultiPathIndustrialProcessor: Entry()",
+  "log.loaded": "MultiPathIndustrialProcessor loaded!",
+  "log.game_launched": "MultiPathIndustrialProcessor: GameLaunched",
+  "log.save_loaded": "MultiPathIndustrialProcessor: SaveLoaded",
+  "log.day_started": "MultiPathIndustrialProcessor: DayStarted"
+}
