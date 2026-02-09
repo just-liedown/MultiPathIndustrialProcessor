@@ -15,7 +15,7 @@ public sealed class ModEntry : Mod
         Monitor.Log(this.I18n.Get("log.entry"), LogLevel.Info);
         Monitor.Log(this.I18n.Get("log.loaded"), LogLevel.Info);
 
-        this.processor = new IndustrialProcessorController(helper, this.Monitor);
+        this.processor = new IndustrialProcessorController(helper, this.Monitor, this.ModManifest.UniqueID);
         this.processor.Register();
 
         helper.Events.GameLoop.GameLaunched += this.OnGameLaunched;

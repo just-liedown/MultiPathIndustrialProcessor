@@ -16,6 +16,8 @@ internal sealed class IndustrialProcessorController
     private const string OutputChestId = "Output";
     private const string StateKey = "MultiPathIndustrialProcessor/IndustrialProcessorState";
     private const int HoldRepeatIntervalTicks = 6;
+    private const string InteractRequestMessageType = "MIP/InteractRequest";
+    private const string InteractResponseMessageType = "MIP/InteractResponse";
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -25,13 +27,20 @@ internal sealed class IndustrialProcessorController
 
     private readonly IModHelper helper;
     private readonly IMonitor monitor;
+    private readonly string modUniqueId;
     private SButton? holdButton;
     private int holdCooldownTicks;
+    private Point? holdPortTile;
+    private string? holdLocationName;
+    private long nextNonce;
+    private long? pendingNonce;
+    private bool pendingSilent;
 
-    public IndustrialProcessorController(IModHelper helper, IMonitor monitor)
+    public IndustrialProcessorController(IModHelper helper, IMonitor monitor, string modUniqueId)
     {
         this.helper = helper;
         this.monitor = monitor;
+        this.modUniqueId = modUniqueId;
     }
 
     public void Register()
@@ -41,6 +50,7 @@ internal sealed class IndustrialProcessorController
         helper.Events.Input.ButtonReleased += this.OnButtonReleased;
         helper.Events.GameLoop.UpdateTicked += this.OnUpdateTicked;
         helper.Events.GameLoop.TimeChanged += this.OnTimeChanged;
+        helper.Events.Multiplayer.ModMessageReceived += this.OnModMessageReceived;
     }
 
     private void OnAssetRequested(object? sender, AssetRequestedEventArgs e)
@@ -109,26 +119,78 @@ internal sealed class IndustrialProcessorController
         // front of the player (grab tile) to match vanilla behavior.
         var portTileCandidates = new[] { playerTile, grabTile };
 
-        foreach (var portTile in portTileCandidates)
+        // Host-authoritative multiplayer:
+        // - main player runs the logic locally (and is the only one that mutates state / advances timers)
+        // - farmhands send interaction requests to the main player, except output chest UI which is safe to open locally
+        if (Context.IsMainPlayer)
         {
-            if (!this.TryHandleAtPortTile(location, who, portTile, silent: false, out var consumed))
-                continue;
-
-            helper.Input.Suppress(e.Button);
-
-            // enable hold-to-repeat only if we actually consumed input (i.e. started a job)
-            if (consumed)
+            foreach (var portTile in portTileCandidates)
             {
-                this.holdButton = e.Button;
-                this.holdCooldownTicks = HoldRepeatIntervalTicks;
-            }
-            else
-            {
-                this.holdButton = null;
-                this.holdCooldownTicks = 0;
-            }
+                if (!this.TryHandleAtPortTile(location, who, portTile, silent: false, allowMenus: true, out var consumed, out _))
+                    continue;
 
-            return;
+                helper.Input.Suppress(e.Button);
+
+                // enable hold-to-repeat only if we actually consumed input (i.e. started a job)
+                if (consumed)
+                {
+                    this.holdButton = e.Button;
+                    this.holdCooldownTicks = HoldRepeatIntervalTicks;
+                }
+                else
+                {
+                    this.holdButton = null;
+                    this.holdCooldownTicks = 0;
+                }
+
+                return;
+            }
+        }
+        else
+        {
+            foreach (var portTile in portTileCandidates)
+            {
+                if (!this.TryGetProcessorForPortTile(location, portTile, out var building))
+                    continue;
+
+                if (!this.TryClassifyPort(building, portTile, out var kind, out _))
+                    continue;
+
+                helper.Input.Suppress(e.Button);
+
+                if (kind == PortKind.Output)
+                {
+                    _ = this.OpenOutput(building);
+                    return;
+                }
+
+                if (kind == PortKind.Terminal)
+                {
+                    Game1.addHUDMessage(new HUDMessage("IndustrialProcessor: terminal not implemented yet (v1)."));
+                    return;
+                }
+
+                // request host to handle all state mutations and inventory consumption
+                this.SendInteractRequest(location, portTile, silent: false);
+
+                // enable hold-to-repeat only for module ports; the response decides whether we keep repeating
+                if (kind == PortKind.Module)
+                {
+                    this.holdButton = e.Button;
+                    this.holdCooldownTicks = 0;
+                    this.holdPortTile = portTile;
+                    this.holdLocationName = location.NameOrUniqueName;
+                }
+                else
+                {
+                    this.holdButton = null;
+                    this.holdCooldownTicks = 0;
+                    this.holdPortTile = null;
+                    this.holdLocationName = null;
+                }
+
+                return;
+            }
         }
     }
 
@@ -142,6 +204,9 @@ internal sealed class IndustrialProcessorController
 
         this.holdButton = null;
         this.holdCooldownTicks = 0;
+        this.holdPortTile = null;
+        this.holdLocationName = null;
+        this.pendingNonce = null;
     }
 
     private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
@@ -157,8 +222,14 @@ internal sealed class IndustrialProcessorController
         {
             this.holdButton = null;
             this.holdCooldownTicks = 0;
+            this.holdPortTile = null;
+            this.holdLocationName = null;
+            this.pendingNonce = null;
             return;
         }
+
+        if (this.pendingNonce is not null)
+            return; // wait for host response before sending another request
 
         if (this.holdCooldownTicks > 0)
         {
@@ -174,25 +245,59 @@ internal sealed class IndustrialProcessorController
         var playerTile = who.TilePoint;
         var grabTile = who.GetGrabTile().ToPoint();
 
-        // repeat on the same interaction model as a press: stand tile first, then grab tile.
-        var portTileCandidates = new[] { playerTile, grabTile };
-        foreach (var portTile in portTileCandidates)
+        if (Context.IsMainPlayer)
         {
-            if (this.TryHandleAtPortTile(location, who, portTile, silent: true, out var consumed) && consumed)
+            // repeat on the same interaction model as a press: stand tile first, then grab tile.
+            var portTileCandidates = new[] { playerTile, grabTile };
+            foreach (var portTile in portTileCandidates)
             {
-                this.holdCooldownTicks = HoldRepeatIntervalTicks;
-                return;
+                if (this.TryHandleAtPortTile(location, who, portTile, silent: true, allowMenus: true, out var consumed, out _) && consumed)
+                {
+                    this.holdCooldownTicks = HoldRepeatIntervalTicks;
+                    return;
+                }
             }
+
+            // nothing consumed => stop repeating to avoid spamming attempts
+            this.holdButton = null;
+            this.holdCooldownTicks = 0;
+            return;
         }
 
-        // nothing consumed => stop repeating to avoid spamming attempts
-        this.holdButton = null;
-        this.holdCooldownTicks = 0;
+        // Farmhand: keep repeating only while still interacting with the same port tile.
+        if (this.holdPortTile is null || this.holdLocationName is null)
+        {
+            this.holdButton = null;
+            this.holdCooldownTicks = 0;
+            return;
+        }
+
+        if (!string.Equals(location.NameOrUniqueName, this.holdLocationName, StringComparison.Ordinal))
+        {
+            this.holdButton = null;
+            this.holdCooldownTicks = 0;
+            this.holdPortTile = null;
+            this.holdLocationName = null;
+            return;
+        }
+
+        var candidates = new[] { playerTile, grabTile };
+        if (candidates[0] != this.holdPortTile.Value && candidates[1] != this.holdPortTile.Value)
+        {
+            this.holdButton = null;
+            this.holdCooldownTicks = 0;
+            this.holdPortTile = null;
+            this.holdLocationName = null;
+            return;
+        }
+
+        this.SendInteractRequest(location, this.holdPortTile.Value, silent: true);
     }
 
-    private bool TryHandleAtPortTile(GameLocation location, Farmer who, Point portTile, bool silent, out bool consumed)
+    private bool TryHandleAtPortTile(GameLocation location, Farmer who, Point portTile, bool silent, bool allowMenus, out bool consumed, out string? message)
     {
         consumed = false;
+        message = null;
 
         var buildingSearchTiles = new[]
         {
@@ -209,7 +314,7 @@ internal sealed class IndustrialProcessorController
             if (building is null || !this.IsProcessor(building))
                 continue;
 
-            if (!this.TryHandleInteraction(building, portTile, who, silent, out consumed))
+            if (!this.TryHandleInteraction(building, portTile, who, silent, allowMenus, out consumed, out message))
                 continue;
 
             return true;
@@ -221,6 +326,10 @@ internal sealed class IndustrialProcessorController
     private void OnTimeChanged(object? sender, TimeChangedEventArgs e)
     {
         if (!Context.IsWorldReady)
+            return;
+
+        // Only the main player should advance timers and mutate building state.
+        if (!Context.IsMainPlayer)
             return;
 
         foreach (var location in Game1.locations)
@@ -256,9 +365,10 @@ internal sealed class IndustrialProcessorController
         }
     }
 
-    private bool TryHandleInteraction(Building building, Point portTile, Farmer who, bool silent, out bool consumed)
+    private bool TryHandleInteraction(Building building, Point portTile, Farmer who, bool silent, bool allowMenus, out bool consumed, out string? message)
     {
         consumed = false;
+        message = null;
 
         var origin = new Point(building.tileX.Value, building.tileY.Value);
         // v1 layout (per design doc):
@@ -271,17 +381,24 @@ internal sealed class IndustrialProcessorController
         var terminalPort = new Point(origin.X + 7, origin.Y + 2);
 
         if (portTile == outputPort)
-            return this.OpenOutput(building);
+        {
+            if (allowMenus)
+                _ = this.OpenOutput(building);
+            return true;
+        }
 
         if (portTile == terminalPort)
         {
             if (!silent)
+            {
                 monitor.Log("IndustrialProcessor: terminal not implemented yet (v1).", LogLevel.Info);
+                message = "IndustrialProcessor: terminal not implemented yet (v1).";
+            }
             return true;
         }
 
         if (portTile == coalPort)
-            return this.TryHandleCoalPort(building, who);
+            return this.TryHandleCoalPort(building, who, silent, out message);
 
         if (portTile.Y == origin.Y + 4)
         {
@@ -298,7 +415,7 @@ internal sealed class IndustrialProcessorController
             };
 
             if (module is not null)
-                return this.TryStartModuleJob(building, module.Value, who, silent, out consumed);
+                return this.TryStartModuleJob(building, module.Value, who, silent, out consumed, out message);
         }
 
         return false;
@@ -317,21 +434,26 @@ internal sealed class IndustrialProcessorController
         return true;
     }
 
-    private bool TryHandleCoalPort(Building building, Farmer who)
+    private bool TryHandleCoalPort(Building building, Farmer who, bool silent, out string? message)
     {
+        message = null;
         var state = this.GetOrCreateState(building);
 
         var held = who.ActiveItem;
         if (held is null)
         {
             var available = state.Fuel - state.FuelReserved;
-            monitor.Log($"IndustrialProcessor: fuel = {state.Fuel} (available {available}, reserved {state.FuelReserved}).", LogLevel.Info);
+            message = $"IndustrialProcessor: fuel = {state.Fuel} (available {available}, reserved {state.FuelReserved}).";
+            if (!silent)
+                monitor.Log(message, LogLevel.Info);
             return true;
         }
 
         if (held.QualifiedItemId != "(O)382")
         {
-            monitor.Log("IndustrialProcessor: put Coal here to add fuel.", LogLevel.Info);
+            message = "IndustrialProcessor: put Coal here to add fuel.";
+            if (!silent)
+                monitor.Log(message, LogLevel.Info);
             return true;
         }
 
@@ -340,13 +462,16 @@ internal sealed class IndustrialProcessorController
         this.SaveState(building, state);
         this.ConsumeActiveItem(who, add);
         var availableAfter = state.Fuel - state.FuelReserved;
-        monitor.Log($"IndustrialProcessor: added fuel +{add} (total {state.Fuel}, available {availableAfter}).", LogLevel.Info);
+        message = $"IndustrialProcessor: added fuel +{add} (total {state.Fuel}, available {availableAfter}).";
+        if (!silent)
+            monitor.Log(message, LogLevel.Info);
         return true;
     }
 
-    private bool TryStartModuleJob(Building building, IndustrialModule module, Farmer who, bool silent, out bool consumed)
+    private bool TryStartModuleJob(Building building, IndustrialModule module, Farmer who, bool silent, out bool consumed, out string? message)
     {
         consumed = false;
+        message = null;
 
         var held = who.ActiveItem;
         if (held is null)
@@ -359,13 +484,16 @@ internal sealed class IndustrialProcessorController
         if (moduleState.Tasks.Count >= capacity)
         {
             if (!silent)
-                monitor.Log($"IndustrialProcessor: {module} is full ({capacity}).", LogLevel.Info);
+            {
+                message = $"IndustrialProcessor: {module} is full ({capacity}).";
+                monitor.Log(message, LogLevel.Info);
+            }
             return true;
         }
 
         if (module == IndustrialModule.Smelt)
         {
-            var started = this.TryStartSmeltJob(building, who, state, moduleState, held, silent);
+            var started = this.TryStartSmeltJob(building, who, state, moduleState, held, silent, out message);
             consumed = started;
             return true;
         }
@@ -373,7 +501,10 @@ internal sealed class IndustrialProcessorController
         if (!this.TryCreateMachineJob(module, held, who, out var job))
         {
             if (!silent)
-                monitor.Log($"IndustrialProcessor: item not accepted by {module}.", LogLevel.Info);
+            {
+                message = $"IndustrialProcessor: item not accepted by {module}.";
+                monitor.Log(message, LogLevel.Info);
+            }
             return true;
         }
 
@@ -381,25 +512,35 @@ internal sealed class IndustrialProcessorController
         this.SaveState(building, state);
         this.ConsumeActiveItem(who, 1);
         if (!silent)
-            monitor.Log($"IndustrialProcessor: started {module}, ready in {job.Minutes} min -> {job.OutputItemId} x{job.OutputStack}.", LogLevel.Info);
+        {
+            message = $"IndustrialProcessor: started {module}, ready in {job.Minutes} min -> {job.OutputItemId} x{job.OutputStack}.";
+            monitor.Log(message, LogLevel.Info);
+        }
         consumed = true;
         return true;
     }
 
-    private bool TryStartSmeltJob(Building building, Farmer who, IndustrialProcessorState state, IndustrialModuleState moduleState, Item held, bool silent)
+    private bool TryStartSmeltJob(Building building, Farmer who, IndustrialProcessorState state, IndustrialModuleState moduleState, Item held, bool silent, out string? message)
     {
+        message = null;
         // Coal is handled by the dedicated coal port.
         if (!IndustrialSmelting.TryGetRecipe(held.QualifiedItemId, out var recipe))
         {
             if (!silent)
-                monitor.Log("IndustrialProcessor: smelting port accepts ore/quartz only.", LogLevel.Info);
+            {
+                message = "IndustrialProcessor: smelting port accepts ore/quartz only.";
+                monitor.Log(message, LogLevel.Info);
+            }
             return false;
         }
 
         if (held.Stack < recipe.InputCount)
         {
             if (!silent)
-                monitor.Log($"IndustrialProcessor: need {recipe.InputCount}x input for smelting.", LogLevel.Info);
+            {
+                message = $"IndustrialProcessor: need {recipe.InputCount}x input for smelting.";
+                monitor.Log(message, LogLevel.Info);
+            }
             return false;
         }
 
@@ -432,12 +573,18 @@ internal sealed class IndustrialProcessorController
         if (job.ReadyAtAbsoluteMinutes > 0)
         {
             if (!silent)
-                monitor.Log($"IndustrialProcessor: started Smelt, ready in {recipe.Minutes} min -> {recipe.OutputItemId} x{recipe.OutputStack}.", LogLevel.Info);
+            {
+                message = $"IndustrialProcessor: started Smelt, ready in {recipe.Minutes} min -> {recipe.OutputItemId} x{recipe.OutputStack}.";
+                monitor.Log(message, LogLevel.Info);
+            }
         }
         else
         {
             if (!silent)
-                monitor.Log($"IndustrialProcessor: queued Smelt (waiting for coal), will take {recipe.Minutes} min -> {recipe.OutputItemId} x{recipe.OutputStack}.", LogLevel.Info);
+            {
+                message = $"IndustrialProcessor: queued Smelt (waiting for coal), will take {recipe.Minutes} min -> {recipe.OutputItemId} x{recipe.OutputStack}.";
+                monitor.Log(message, LogLevel.Info);
+            }
         }
 
         return true;
@@ -624,5 +771,205 @@ internal sealed class IndustrialProcessorController
         }
 
         item.Stack -= amount;
+    }
+
+    private void OnModMessageReceived(object? sender, ModMessageReceivedEventArgs e)
+    {
+        if (!Context.IsWorldReady)
+            return;
+
+        if (!string.Equals(e.FromModID, this.modUniqueId, StringComparison.Ordinal))
+            return;
+
+        if (string.Equals(e.Type, InteractRequestMessageType, StringComparison.Ordinal))
+        {
+            if (!Context.IsMainPlayer)
+                return;
+
+            var req = e.ReadAs<InteractRequest>();
+            var who = Game1.GetPlayer(e.FromPlayerID);
+            var location = who?.currentLocation ?? Game1.getLocationFromName(req.LocationName);
+
+            var handled = false;
+            var consumed = false;
+            string? message = null;
+
+            if (who is not null && location is not null)
+                handled = this.TryHandleAtPortTile(location, who, new Point(req.TileX, req.TileY), req.Silent, allowMenus: false, out consumed, out message);
+
+            helper.Multiplayer.SendMessage(
+                new InteractResponse
+                {
+                    Nonce = req.Nonce,
+                    Handled = handled,
+                    Consumed = consumed,
+                    Message = req.Silent ? null : message
+                },
+                InteractResponseMessageType,
+                modIDs: new[] { this.modUniqueId },
+                playerIDs: new[] { e.FromPlayerID }
+            );
+
+            return;
+        }
+
+        if (string.Equals(e.Type, InteractResponseMessageType, StringComparison.Ordinal))
+        {
+            var resp = e.ReadAs<InteractResponse>();
+            if (this.pendingNonce is null || resp.Nonce != this.pendingNonce.Value)
+                return;
+
+            this.pendingNonce = null;
+
+            if (!this.pendingSilent && !string.IsNullOrWhiteSpace(resp.Message))
+                Game1.addHUDMessage(new HUDMessage(resp.Message));
+
+            // If the host didn't consume input (i.e. couldn't start a job), stop repeating to avoid spam.
+            if (this.holdButton is not null && !resp.Consumed)
+            {
+                this.holdButton = null;
+                this.holdCooldownTicks = 0;
+                this.holdPortTile = null;
+                this.holdLocationName = null;
+                return;
+            }
+
+            // If we did consume, schedule the next repeat interval.
+            if (this.holdButton is not null && resp.Consumed)
+                this.holdCooldownTicks = HoldRepeatIntervalTicks;
+
+            return;
+        }
+    }
+
+    private void SendInteractRequest(GameLocation location, Point portTile, bool silent)
+    {
+        // Only farmhands should send requests. Main player runs logic locally.
+        if (Context.IsMainPlayer)
+            return;
+
+        if (this.pendingNonce is not null)
+            return;
+
+        var nonce = ++this.nextNonce;
+        this.pendingNonce = nonce;
+        this.pendingSilent = silent;
+
+        helper.Multiplayer.SendMessage(
+            new InteractRequest
+            {
+                Nonce = nonce,
+                LocationName = location.NameOrUniqueName,
+                TileX = portTile.X,
+                TileY = portTile.Y,
+                Silent = silent
+            },
+            InteractRequestMessageType,
+            modIDs: new[] { this.modUniqueId },
+            playerIDs: new[] { Game1.MasterPlayer.UniqueMultiplayerID }
+        );
+    }
+
+    private bool TryGetProcessorForPortTile(GameLocation location, Point portTile, out Building building)
+    {
+        building = null!;
+
+        var buildingSearchTiles = new[]
+        {
+            portTile,
+            new Point(portTile.X, portTile.Y - 1),
+            new Point(portTile.X, portTile.Y + 1),
+            new Point(portTile.X + 1, portTile.Y),
+            new Point(portTile.X - 1, portTile.Y)
+        };
+
+        foreach (var tile in buildingSearchTiles)
+        {
+            var found = location.getBuildingAt(new Vector2(tile.X, tile.Y));
+            if (found is null || !this.IsProcessor(found))
+                continue;
+
+            building = found;
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool TryClassifyPort(Building building, Point portTile, out PortKind kind, out IndustrialModule? module)
+    {
+        kind = default;
+        module = null;
+
+        var origin = new Point(building.tileX.Value, building.tileY.Value);
+        var outputPort = new Point(origin.X + 3, origin.Y - 1);
+        var coalPort = new Point(origin.X - 1, origin.Y + 2);
+        var terminalPort = new Point(origin.X + 7, origin.Y + 2);
+
+        if (portTile == outputPort)
+        {
+            kind = PortKind.Output;
+            return true;
+        }
+
+        if (portTile == coalPort)
+        {
+            kind = PortKind.Coal;
+            return true;
+        }
+
+        if (portTile == terminalPort)
+        {
+            kind = PortKind.Terminal;
+            return true;
+        }
+
+        if (portTile.Y == origin.Y + 4)
+        {
+            var dx = portTile.X - origin.X;
+            module = dx switch
+            {
+                0 => IndustrialModule.Animal,
+                1 => IndustrialModule.Brew,
+                2 => IndustrialModule.Preserve,
+                3 => IndustrialModule.Smelt,
+                4 => IndustrialModule.Wool,
+                5 => IndustrialModule.Oil,
+                _ => (IndustrialModule?)null
+            };
+
+            if (module is not null)
+            {
+                kind = PortKind.Module;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private enum PortKind
+    {
+        Output,
+        Coal,
+        Terminal,
+        Module
+    }
+
+    private sealed class InteractRequest
+    {
+        public long Nonce { get; set; }
+        public string LocationName { get; set; } = "";
+        public int TileX { get; set; }
+        public int TileY { get; set; }
+        public bool Silent { get; set; }
+    }
+
+    private sealed class InteractResponse
+    {
+        public long Nonce { get; set; }
+        public bool Handled { get; set; }
+        public bool Consumed { get; set; }
+        public string? Message { get; set; }
     }
 }
