@@ -15,6 +15,7 @@ internal sealed class IndustrialProcessorController
     private const string BuildingId = "IndustrialProcessor";
     private const string OutputChestId = "Output";
     private const string StateKey = "MultiPathIndustrialProcessor/IndustrialProcessorState";
+    private const int HoldRepeatIntervalTicks = 6;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -24,6 +25,8 @@ internal sealed class IndustrialProcessorController
 
     private readonly IModHelper helper;
     private readonly IMonitor monitor;
+    private SButton? holdButton;
+    private int holdCooldownTicks;
 
     public IndustrialProcessorController(IModHelper helper, IMonitor monitor)
     {
@@ -35,6 +38,8 @@ internal sealed class IndustrialProcessorController
     {
         helper.Events.Content.AssetRequested += this.OnAssetRequested;
         helper.Events.Input.ButtonPressed += this.OnButtonPressed;
+        helper.Events.Input.ButtonReleased += this.OnButtonReleased;
+        helper.Events.GameLoop.UpdateTicked += this.OnUpdateTicked;
         helper.Events.GameLoop.TimeChanged += this.OnTimeChanged;
     }
 
@@ -106,28 +111,111 @@ internal sealed class IndustrialProcessorController
 
         foreach (var portTile in portTileCandidates)
         {
-            var buildingSearchTiles = new[]
+            if (!this.TryHandleAtPortTile(location, who, portTile, silent: false, out var consumed))
+                continue;
+
+            helper.Input.Suppress(e.Button);
+
+            // enable hold-to-repeat only if we actually consumed input (i.e. started a job)
+            if (consumed)
             {
-                portTile,
-                new Point(portTile.X, portTile.Y - 1),
-                new Point(portTile.X, portTile.Y + 1),
-                new Point(portTile.X + 1, portTile.Y),
-                new Point(portTile.X - 1, portTile.Y)
-            };
-
-            foreach (var tile in buildingSearchTiles)
+                this.holdButton = e.Button;
+                this.holdCooldownTicks = HoldRepeatIntervalTicks;
+            }
+            else
             {
-                var building = location.getBuildingAt(new Vector2(tile.X, tile.Y));
-                if (building is null || !this.IsProcessor(building))
-                    continue;
+                this.holdButton = null;
+                this.holdCooldownTicks = 0;
+            }
 
-                if (!this.TryHandleInteraction(building, portTile, who))
-                    continue;
+            return;
+        }
+    }
 
-                helper.Input.Suppress(e.Button);
+    private void OnButtonReleased(object? sender, ButtonReleasedEventArgs e)
+    {
+        if (this.holdButton is null)
+            return;
+
+        if (e.Button != this.holdButton.Value)
+            return;
+
+        this.holdButton = null;
+        this.holdCooldownTicks = 0;
+    }
+
+    private void OnUpdateTicked(object? sender, UpdateTickedEventArgs e)
+    {
+        if (!Context.IsWorldReady)
+            return;
+
+        if (this.holdButton is null)
+            return;
+
+        // stop repeating if player released the button, opened a menu, etc.
+        if (!this.helper.Input.IsDown(this.holdButton.Value) || Game1.activeClickableMenu is not null)
+        {
+            this.holdButton = null;
+            this.holdCooldownTicks = 0;
+            return;
+        }
+
+        if (this.holdCooldownTicks > 0)
+        {
+            this.holdCooldownTicks--;
+            return;
+        }
+
+        var location = Game1.currentLocation;
+        if (location is null)
+            return;
+
+        var who = Game1.player;
+        var playerTile = who.TilePoint;
+        var grabTile = who.GetGrabTile().ToPoint();
+
+        // repeat on the same interaction model as a press: stand tile first, then grab tile.
+        var portTileCandidates = new[] { playerTile, grabTile };
+        foreach (var portTile in portTileCandidates)
+        {
+            if (this.TryHandleAtPortTile(location, who, portTile, silent: true, out var consumed) && consumed)
+            {
+                this.holdCooldownTicks = HoldRepeatIntervalTicks;
                 return;
             }
         }
+
+        // nothing consumed => stop repeating to avoid spamming attempts
+        this.holdButton = null;
+        this.holdCooldownTicks = 0;
+    }
+
+    private bool TryHandleAtPortTile(GameLocation location, Farmer who, Point portTile, bool silent, out bool consumed)
+    {
+        consumed = false;
+
+        var buildingSearchTiles = new[]
+        {
+            portTile,
+            new Point(portTile.X, portTile.Y - 1),
+            new Point(portTile.X, portTile.Y + 1),
+            new Point(portTile.X + 1, portTile.Y),
+            new Point(portTile.X - 1, portTile.Y)
+        };
+
+        foreach (var tile in buildingSearchTiles)
+        {
+            var building = location.getBuildingAt(new Vector2(tile.X, tile.Y));
+            if (building is null || !this.IsProcessor(building))
+                continue;
+
+            if (!this.TryHandleInteraction(building, portTile, who, silent, out consumed))
+                continue;
+
+            return true;
+        }
+
+        return false;
     }
 
     private void OnTimeChanged(object? sender, TimeChangedEventArgs e)
@@ -168,8 +256,10 @@ internal sealed class IndustrialProcessorController
         }
     }
 
-    private bool TryHandleInteraction(Building building, Point portTile, Farmer who)
+    private bool TryHandleInteraction(Building building, Point portTile, Farmer who, bool silent, out bool consumed)
     {
+        consumed = false;
+
         var origin = new Point(building.tileX.Value, building.tileY.Value);
         // v1 layout (per design doc):
         // - bottom: 6 input ports
@@ -185,7 +275,8 @@ internal sealed class IndustrialProcessorController
 
         if (portTile == terminalPort)
         {
-            monitor.Log("IndustrialProcessor: terminal not implemented yet (v1).", LogLevel.Info);
+            if (!silent)
+                monitor.Log("IndustrialProcessor: terminal not implemented yet (v1).", LogLevel.Info);
             return true;
         }
 
@@ -207,7 +298,7 @@ internal sealed class IndustrialProcessorController
             };
 
             if (module is not null)
-                return this.TryStartModuleJob(building, module.Value, who);
+                return this.TryStartModuleJob(building, module.Value, who, silent, out consumed);
         }
 
         return false;
@@ -253,11 +344,13 @@ internal sealed class IndustrialProcessorController
         return true;
     }
 
-    private bool TryStartModuleJob(Building building, IndustrialModule module, Farmer who)
+    private bool TryStartModuleJob(Building building, IndustrialModule module, Farmer who, bool silent, out bool consumed)
     {
+        consumed = false;
+
         var held = who.ActiveItem;
         if (held is null)
-            return true;
+            return true; // handled, but nothing to consume
 
         var state = this.GetOrCreateState(building);
         var moduleState = state.GetModuleState(module);
@@ -265,39 +358,49 @@ internal sealed class IndustrialProcessorController
 
         if (moduleState.Tasks.Count >= capacity)
         {
-            monitor.Log($"IndustrialProcessor: {module} is full ({capacity}).", LogLevel.Info);
+            if (!silent)
+                monitor.Log($"IndustrialProcessor: {module} is full ({capacity}).", LogLevel.Info);
             return true;
         }
 
         if (module == IndustrialModule.Smelt)
-            return this.TryStartSmeltJob(building, who, state, moduleState, held);
+        {
+            var started = this.TryStartSmeltJob(building, who, state, moduleState, held, silent);
+            consumed = started;
+            return true;
+        }
 
         if (!this.TryCreateMachineJob(module, held, who, out var job))
         {
-            monitor.Log($"IndustrialProcessor: item not accepted by {module}.", LogLevel.Info);
+            if (!silent)
+                monitor.Log($"IndustrialProcessor: item not accepted by {module}.", LogLevel.Info);
             return true;
         }
 
         moduleState.Tasks.Add(job);
         this.SaveState(building, state);
         this.ConsumeActiveItem(who, 1);
-        monitor.Log($"IndustrialProcessor: started {module}, ready in {job.Minutes} min -> {job.OutputItemId} x{job.OutputStack}.", LogLevel.Info);
+        if (!silent)
+            monitor.Log($"IndustrialProcessor: started {module}, ready in {job.Minutes} min -> {job.OutputItemId} x{job.OutputStack}.", LogLevel.Info);
+        consumed = true;
         return true;
     }
 
-    private bool TryStartSmeltJob(Building building, Farmer who, IndustrialProcessorState state, IndustrialModuleState moduleState, Item held)
+    private bool TryStartSmeltJob(Building building, Farmer who, IndustrialProcessorState state, IndustrialModuleState moduleState, Item held, bool silent)
     {
         // Coal is handled by the dedicated coal port.
         if (!IndustrialSmelting.TryGetRecipe(held.QualifiedItemId, out var recipe))
         {
-            monitor.Log("IndustrialProcessor: smelting port accepts ore/quartz only.", LogLevel.Info);
-            return true;
+            if (!silent)
+                monitor.Log("IndustrialProcessor: smelting port accepts ore/quartz only.", LogLevel.Info);
+            return false;
         }
 
         if (held.Stack < recipe.InputCount)
         {
-            monitor.Log($"IndustrialProcessor: need {recipe.InputCount}x input for smelting.", LogLevel.Info);
-            return true;
+            if (!silent)
+                monitor.Log($"IndustrialProcessor: need {recipe.InputCount}x input for smelting.", LogLevel.Info);
+            return false;
         }
 
         var now = this.GetNowAbsoluteMinutes();
@@ -327,9 +430,16 @@ internal sealed class IndustrialProcessorController
         this.SaveState(building, state);
         this.ConsumeActiveItem(who, recipe.InputCount);
         if (job.ReadyAtAbsoluteMinutes > 0)
-            monitor.Log($"IndustrialProcessor: started Smelt, ready in {recipe.Minutes} min -> {recipe.OutputItemId} x{recipe.OutputStack}.", LogLevel.Info);
+        {
+            if (!silent)
+                monitor.Log($"IndustrialProcessor: started Smelt, ready in {recipe.Minutes} min -> {recipe.OutputItemId} x{recipe.OutputStack}.", LogLevel.Info);
+        }
         else
-            monitor.Log($"IndustrialProcessor: queued Smelt (waiting for coal), will take {recipe.Minutes} min -> {recipe.OutputItemId} x{recipe.OutputStack}.", LogLevel.Info);
+        {
+            if (!silent)
+                monitor.Log($"IndustrialProcessor: queued Smelt (waiting for coal), will take {recipe.Minutes} min -> {recipe.OutputItemId} x{recipe.OutputStack}.", LogLevel.Info);
+        }
+
         return true;
     }
 
