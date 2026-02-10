@@ -1,0 +1,9 @@
+{
+  "Name": "Online Shopping",
+  "Author": "just-liedown",
+  "Version": "0.1.0",
+  "Description": "Adds a Buy option to the vanilla phone UI for Robin, opening the normal shop menu remotely.",
+  "UniqueID": "just-liedown.OnlineShopping",
+  "EntryDll": "OnlineShopping.dll",
+  "MinimumApiVersion": "4.0.0"
+}
